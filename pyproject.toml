@@ -1,0 +1,42 @@
+[project]
+name = "axisarw"
+version = "0.3.0"
+description = "Axis-aligned residual grafts for frozen language models"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.4.0",
+    "transformers>=4.45.0",
+    "datasets>=3.0.0",
+    "safetensors>=0.4.0",
+]
+
+[project.optional-dependencies]
+gpu = [
+    "flash-attn>=2.6.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+only-include = [
+    "autopsy.py",
+    "dataset.py",
+    "engine.py",
+    "eval.py",
+    "train.py",
+]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "autopsy.py",
+    "dataset.py",
+    "engine.py",
+    "eval.py",
+    "train.py",
+    "README.md",
+    "LICENSE",
+    "pyproject.toml",
+]

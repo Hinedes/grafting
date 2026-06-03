@@ -90,11 +90,19 @@ Train a graft (MI300X-class config). Reduce `--batch_size`, `--max_len`, or laye
 
 ```bash
 uv run python train.py \
+uv run python train.py \
   --model HuggingFaceTB/SmolLM3-3B \
   --domain_data medical.jsonl \
   --ood_data legal.jsonl coding.jsonl finance.jsonl minipile.jsonl \
+  --ood_data legal.jsonl coding.jsonl finance.jsonl minipile.jsonl \
   --domain_index 0 \
   --max_domains 4 \
+  --lambda_silence 5.0 \
+  --steps 200 \
+  --batch_size 16 \
+  --max_len 512 \
+  --num_workers 8 \
+  --fa2 \
   --lambda_silence 5.0 \
   --steps 200 \
   --batch_size 16 \
@@ -119,6 +127,11 @@ Bake artifacts directly into the model weights (creates a new directory):
 ```bash
 uv run python eval.py install \
   --graft medical.graft.pt legal.graft.pt coding.graft.pt finance.graft.pt \
+uv run python eval.py install \
+  --graft medical.graft.pt legal.graft.pt coding.graft.pt finance.graft.pt \
   --output smol-grafted
 
 ```
+---
+
+**Acknowledgement:** Massive thanks to the **AMD Developer Cloud** for the compute access and the **MI300X** horsepower that made this research possible.
