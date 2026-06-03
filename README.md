@@ -1,103 +1,124 @@
-# Grafting
+# Grafting v0.3 (Axis ARW)
 
-Train small, swappable domain patches for frozen language models.  
-One base model, many grafts. No inference overhead.
+This architecture started as a simple daydream (the AuDHD kind, the looping kind): expose a frozen model to novel data, let its gradients ignore what it already knows, and capture its frantic reactions to out-of-distribution tokens. Pack those raw gradient descent responses into a standalone file, and you have a graft. 
 
-## What it does
+It sounded too simple. I thought, "This can't work." (I have no ML background, so what do I know.) Then the telemetry came in. My brain told me: _"Don't you dare say it!"_ But I said: **_"Jackpot!"_** And then I spent two more weeks making it work. ("It would appear, daydreaming can't code, but i, Hinedes, have a dream!")
 
-A graft is a file. Install it on a base model and the model gets better at a specific domain: medicine, law, coding, niche slang. Remove it and the base model is untouched. Stack a few together and they mostly stay out of each other's way.
+Probing the residual stream on the SmolLM3-3B medical graft revealed a +0.97 correlation between base model ignorance and graft-induced loss reduction. The frozen model acts as a filter for its own ignorance. When the base model is confused, the graft corrects; when the base model is confident, the graft contributes essentially zero. It is a self-distilling, opportunistic error-catcher.
 
-The graft only learns what the base model doesn't already know. The base handles ordinary English. The graft picks up the rest. This happens automatically because the base is frozen and the graft is confined to a fixed set of FFN channels.
+At install time, it completely abandons the overlapping mathematical superposition of v0.1. There is no decoding key. Instead, the 300 MB graft folds directly into a hard, isolated slice of the base weights:
 
-## Why it works
+$$W_{\text{new}}[s_y:e_y, s_x:e_x] = W_{\text{base}}[s_y:e_y, s_x:e_x] + \Delta_{\text{graft}}$$
 
-Earlier versions used rotated subspaces. That was elegant but broke inside the SwiGLU gate. The element-wise multiply scattered the signal and created cross-talk between grafts.
+The base model reads the graft natively because the graft physically becomes a room inside the host's FFN geometry. The domains never touch during expansion or contraction because their index ranges have a hard wall between them.
 
-Axis ARW drops the rotations. Each domain gets its own slice of the FFN intermediate channels. Gate and up projections for domain A never touch the same channels as domain B. The SiLU mixer has nothing to mix. Cross-talk drops roughly 25x compared to the rotated version.
+---
 
-## Install
+## The Mixer Problem (Blender Slander, Orthogonality Must Die)
+
+Version 0.1 relied on rotated orthogonal subspaces. Beautiful on paper. Completely broken in silicon.
+
+Why? Because Transformer non-linearities don't care about linear algebra. As was explained to me later on, the SwiGLU block uses element-wise multiplication:
+
+$$y = W_{down} \Big( \text{SiLU}(W_{gate} x) \odot (W_{up} x) \Big)$$
+
+Pass a mathematically orthogonal signal through the SiLU, and it acts like a cryptographic mixer. The subspace shatters. The signal scatters everywhere.
+
+So, Version 0.3 throws out the elegant math in favor of physical walls. It chops the FFN intermediate and residual widths into hard, axis-aligned Boolean masks.
+
+It’s crude. But it’s airtight. (Maybe.)
+
+Disjoint support forces the cross-terms to exactly zero: $\text{SiLU}(\Delta W_{gate}^A x) \odot \Delta W_{up}^B x = 0$. The mixer has nothing to multiply, meaning cross-domain interference inside the FFN is structurally dead.
+
+(We don't touch the attention heads, by the way. The Stem Cell Hypothesis holds up: attention handles syntactic, domain-agnostic routing. Factual knowledge lives in the FFN. Messing with attention is simply architecturally wrong.)
+
+---
+
+## The Residual Tax (Or: The Noisy Roommates)
+
+Inference is free. Training is brutal. And now i have OOM PTSD.
+
+If you want to run the four-domain stack on SmolLM3-3B, you'd need something like AMD MI300X and about 130 GB of VRAM. You have to force massive sequence volume through the base model just to make the silence loss effective. (Machine Learning at its best. Bruteforcing at its finest.) 
+
+And then there’s the residual tax.
+
+Axis-aligned slicing solves the FFN problem, but it exposes another one. The domains still have to dump their outputs into a shared residual stream and route context through shared attention heads. On our stack, Finance and Coding held up fine. Legal, however, took a +2.41 PPL hit. It turned a catastrophic failure into a localized cost, but let's not pretend it eliminated the interference. It just managed it.
+
+---
+
+## A Fragile Equilibrium (Crash course of mistakes, inefficiency and overfitting)
+
+The default config is 200 steps at batch size 16. Stable enough to teach Graft and not overfit.
+
+Don't try to push the step count. Running 10,000 steps at a low batch size is a trap. The optimizer will just inflate the delta weights to scrape fractional loss improvements. You end up training high-energy noise that violently corrupts the shared stream when stacked. Push it to 2,000 steps at BS16, and you fall off an overfitting cliff where the graft starts fighting the base model's syntactic priors.
+
+Two hundred high-energy updates. That seemed to be exactly enough to shift logits and capture the vocabulary. I stopped there.
+
+Your out-of-distribution (OOD) data matters just as much. Training against general web text gives a weak suppression gradient because the model already knows English. To force active suppression, you have to train the graft adversarially against its sibling domains. Medical must fight Legal and Coding to carve out its physical space.
+
+---
+
+## Dead Ends and the Roadmap (I don't have one.)
+
+Portability is strictly locked to the Anchor Rule. A graft only works on a model it was made from. You can't take a SmolLM3-3B graft and drop it into Gemma.
+
+And don't even try this on Hybrid Recurrent or State-Space Models! Grafting requires pure spatial Transformer geometry. Modifying the FFN in a recurrent block permanently poisons the rolling hidden state. The fluid dynamics of those engines will violently reject spatial isolation. I spent few days trying to make it work on Qwen 3.5 2B! Wondering why it didn’t work.
+
+What’s next? Who knows. But i have an idea.
+
+Expansion and contraction are isolated, but the `down_proj` write-back still pollutes the common hallway. The next evolution could be the residual-lane masking, constraining those writes and reads to specific ranges. I mean this whole idea was born from allow forward pass to both model and graft, restrict the backpropogation to graft. It could work again, or not. Until then, this is a highly effective, but fundamentally leaky, multiplexing strategy. 
+
+---
+
+## Operations
+
+Install dependencies (FlashAttention 2 requires CUDA/ROCm and is highly recommended):
 
 ```bash
-pip install torch transformers datasets
+uv sync --extra gpu
+
 ```
 
-## Quick start
-
-Pull some training data, or bring your own JSONL files:
+Download datasets:
 
 ```bash
-python dataset.py
+uv run python dataset.py --domains medical legal finance
+
 ```
 
-Train a graft:
+Train a graft (MI300X-class config). Reduce `--batch_size`, `--max_len`, or layer range if VRAM constrained:
 
 ```bash
-python train.py \
+uv run python train.py \
   --model HuggingFaceTB/SmolLM3-3B \
   --domain_data medical.jsonl \
-  --ood_data minipile.jsonl \
+  --ood_data legal.jsonl coding.jsonl finance.jsonl minipile.jsonl \
   --domain_index 0 \
   --max_domains 4 \
+  --lambda_silence 5.0 \
+  --steps 200 \
+  --batch_size 16 \
+  --max_len 512 \
+  --num_workers 8 \
+  --fa2 \
   --output medical.graft.pt
+
 ```
 
-Train more grafts by changing `--domain_index` (1, 2, 3) and the data files.
-
-Check one graft:
+Stack artifacts and measure interference prior to installation:
 
 ```bash
-python eval.py eval --graft medical.graft.pt --data medical.jsonl
+uv run python eval.py stack-test \
+  --grafts medical.graft.pt legal.graft.pt coding.graft.pt finance.graft.pt \
+  --data medical.jsonl legal.jsonl coding.jsonl finance.jsonl
+
 ```
 
-Stack four grafts and test for interference:
+Bake artifacts directly into the model weights (creates a new directory):
 
 ```bash
-python eval.py stack-test \
-  --grafts medical.graft.pt legal.graft.pt coding.graft.pt niche.graft.pt \
-  --data medical.jsonl legal.jsonl coding.jsonl niche.jsonl
-```
-
-Bake grafts permanently into a model:
-
-```bash
-python eval.py install \
-  --graft medical.graft.pt legal.graft.pt coding.graft.pt niche.graft.pt \
+uv run python eval.py install \
+  --graft medical.graft.pt legal.graft.pt coding.graft.pt finance.graft.pt \
   --output smol-grafted
+
 ```
-
-## Preliminary Results (SmolLM3-3B, delta-only silence loss)
-
-| metric | value |
-|--------|-------|
-| single-graft PPL (medical) | 1.09 |
-| stacked PPL (medical, with legal) | 1.11 |
-| stacked PPL (legal, with medical) | 2.94 |
-| rotated ARW stacked degradation | +25.8 PPL |
-| axis ARW stacked degradation | +0.02 PPL |
-
-The remaining crosstalk comes from `down_proj` mapping all grafts back into the shared hidden size. The SiLU gate problem is solved. The residual stream is the next target.
-
-## Hardware
-
-The scripts pick up whatever PyTorch can see: CUDA, ROCm, MPS, or CPU. On CUDA and ROCm it uses bfloat16 where available. Weights are kept in float32 for training stability.
-
-## Files
-
-- `dataset.py` — pulls training data, wraps it for the loader
-- `engine.py` — finds FFN layers, computes channel slices, attaches the graft during forward
-- `train.py` — training loop
-- `eval.py` — single-graft eval, stacked eval, model install
-
-## Safety checks
-
-The eval and install commands check that grafts:
-
-- are the right artifact version
-- match the model's layer names and weight shapes
-- use the same `max_domains` setting when stacked
-- don't overlap slices or duplicate domain indices
-- get one test file per graft in `stack-test`
-
-## Experiments
-
-Ran on AMD MI300X hardware with support from the AMD Developer Cloud.
