@@ -1,8 +1,10 @@
 import argparse
 import math
 import os
+import sys
 
 import torch
+from safetensors import safe_open
 
 def compute_spectral_stats(w):
     """Compute effective rank and top singular values from a Gram matrix."""
@@ -43,65 +45,58 @@ def autopsy_graft(path):
     print(f"\n{'='*80}")
     print(f" GRAFT AUTOPSY: {os.path.basename(path)}")
     print(f"{'='*80}")
-    
+
     try:
-        art = torch.load(path, map_location="cpu", weights_only=True)
-    except TypeError:
-        art = torch.load(path, map_location="cpu")
-        
-    meta_keys = ["version", "model", "domain_index", "max_domains", "steps", "layer_range"]
-    print("\n[ Metadata ]")
-    for k in meta_keys:
-        if k in art:
-            print(f"  {k:<15}: {art[k]}")
+        with safe_open(path, framework="pt", device="cpu") as f:
+            meta = f.metadata()
 
-    grafts = art.get("grafts", {})
-    if not grafts:
-        print("No graft tensors found in artifact.")
-        return
+            print("\n[ Metadata ]")
+            for k, v in meta.items():
+                print(f"  {k:<15}: {v}")
 
-    total_params = 0
-    total_sq_norm = 0.0
-    global_max, global_min = -float('inf'), float('inf')
-    sum_abs = 0.0
-    
-    layer_stats = []
-    spectral_data = []
-    
-    layer_names = sorted(list(grafts.keys()))
-    n_layers = len(layer_names)
-    
-    sample_indices = set([0, n_layers - 1])
-    if n_layers > 4:
-        sample_indices.update([n_layers // 4, n_layers // 2, 3 * n_layers // 4])
+            keys = list(f.keys())
+            n_layers = len(keys)
 
-    print(f"\n[ Analyzing {n_layers} layers... ]")
-    
-    for idx, name in enumerate(layer_names):
-        g = grafts[name]
-        w = g["delta_slice"].float()
-        
-        numel = w.numel()
-        total_params += numel
-        total_sq_norm += w.norm().item()**2
-        
-        w_max, w_min = w.max().item(), w.min().item()
-        global_max = max(global_max, w_max)
-        global_min = min(global_min, w_min)
-        sum_abs += w.abs().sum().item()
-        
-        sparsity = (w.abs() < 1e-5).sum().item() / numel
-        
-        layer_stats.append({
-            "name": name,
-            "shape": tuple(w.shape),
-            "l2": w.norm().item(),
-            "sparsity": sparsity
-        })
-        
-        if idx in sample_indices:
-            eff_rank, top5, err = compute_spectral_stats(w)
-            spectral_data.append({"name": name, "eff_rank": eff_rank, "top5": top5, "err": err})
+            total_params = 0
+            total_sq_norm = 0.0
+            global_max, global_min = -float('inf'), float('inf')
+            sum_abs = 0.0
+
+            layer_stats = []
+            spectral_data = []
+
+            sample_indices = set([0, n_layers - 1])
+            if n_layers > 4:
+                sample_indices.update([n_layers // 4, n_layers // 2, 3 * n_layers // 4])
+
+            print(f"\n[ Analyzing {n_layers} layers... ]")
+
+            for idx, name in enumerate(keys):
+                w = f.get_tensor(name).float()
+                
+                numel = w.numel()
+                total_params += numel
+                total_sq_norm += w.norm().item()**2
+                
+                w_max, w_min = w.max().item(), w.min().item()
+                global_max = max(global_max, w_max)
+                global_min = min(global_min, w_min)
+                sum_abs += w.abs().sum().item()
+                
+                sparsity = (w.abs() < 1e-5).sum().item() / numel
+                
+                layer_stats.append({
+                    "name": name,
+                    "shape": tuple(w.shape),
+                    "l2": w.norm().item(),
+                    "sparsity": sparsity
+                })
+                
+                if idx in sample_indices:
+                    eff_rank, top5, err = compute_spectral_stats(w)
+                    spectral_data.append({"name": name, "eff_rank": eff_rank, "top5": top5, "err": err})
+    except Exception as e:
+        sys.exit(f"Failed to analyze graft: {e}")
 
     avg_l2 = math.sqrt(total_sq_norm / max(1, total_params))
     mean_abs = sum_abs / max(1, total_params)
@@ -143,7 +138,7 @@ def autopsy_graft(path):
 
 def main():
     parser = argparse.ArgumentParser(description="Inspect AxisARW graft tensor statistics.")
-    parser.add_argument("graft", help="Path to a .graft.pt artifact.")
+    parser.add_argument("graft", help="Path to a .graft artifact.")
     args = parser.parse_args()
     autopsy_graft(args.graft)
 

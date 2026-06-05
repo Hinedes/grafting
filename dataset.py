@@ -1,6 +1,7 @@
 """Dataset download and JSONL loading utilities for AxisARW."""
 
 import argparse
+import os
 import json
 from typing import Any
 
@@ -165,6 +166,7 @@ def extract_text(example: dict[str, Any], cfg: dict[str, Any]):
 
 def fetch_and_save_datasets(domains=None):
     selected_domains = domains or DOMAINS.keys()
+    os.makedirs("data", exist_ok=True)
 
     for name in selected_domains:
         cfg = DOMAINS[name]
@@ -176,7 +178,7 @@ def fetch_and_save_datasets(domains=None):
         ds = load_dataset(**load_kwargs)
         saved, skipped_streak = 0, 0
 
-        with open(f"{name}.jsonl", "w", encoding="utf-8") as f:
+        with open(os.path.join("data", f"{name}.jsonl"), "w", encoding="utf-8") as f:
             for example in ds:
                 text = extract_text(example, cfg)
                 if not isinstance(text, str):
@@ -197,7 +199,7 @@ def fetch_and_save_datasets(domains=None):
                 if saved >= cfg["limit"]:
                     break
 
-        print(f"  saved {saved} examples to {name}.jsonl")
+        print(f"  saved {saved} examples to data/{name}.jsonl")
 
 
 class BalancedPureDataset(Dataset):

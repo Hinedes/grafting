@@ -108,7 +108,7 @@ I didn't eliminate the interference. Legal still got clobbered because it's dens
 
 Portability is strictly locked to the Anchor Rule. A graft only works on a model it was made from. You can't take a SmolLM3‑3B graft and drop it into Gemma.
 
-And don't even try this on Hybrid Recurrent or State‑Space Models! Grafting requires pure spatial Transformer geometry. Modifying the FFN in a recurrent block permanently poisons the rolling hidden state. The fluid dynamics of those engines will violently reject spatial isolation. I spent few days trying to make it work on Qwen 3.5 2B! Wondering why it didn't work.
+And don't even try this on Hybrid Recurrent or State-Space Models! Grafting requires pure spatial Transformer geometry. Modifying the FFN in a recurrent block permanently poisons the rolling hidden state. The fluid dynamics of those engines will violently reject spatial isolation. I spent few days trying to make it work on Qwen 3.5 2B! Wondering why it didn't work.
 
 What's next? Who knows. But i have an idea.
 
@@ -131,57 +131,54 @@ Expansion and contraction are isolated, but the `down_proj` write‑back still p
 Install dependencies (Supports CUDA, ROCm, MPS, CPU. Delta master weights stay float32 during training, saved as bfloat16 on compatible environments):
 
 ```bash
-uv sync --extra gpu
+pip install -e .[gpu]
 
 ```
 
 Download datasets:
 
 ```bash
-uv run python dataset.py --domains medical legal finance
+python dataset.py --domains medical legal finance coding
 
 ```
 
 Train a graft (MI300X‑class config). Reduce `‑‑batch_size`, `‑‑max_len`, or layer range if VRAM constrained:
 
 ```bash
-uv run python train.py \
+python train.py \
   --model HuggingFaceTB/SmolLM3-3B \
-  --domain_data medical.jsonl \
-  --ood_data legal.jsonl coding.jsonl finance.jsonl minipile.jsonl \
-  --domain_index 0 \
+  --domain_data medical \
   --max_domains 4 \
   --lambda_silence 5.0 \
   --steps 200 \
   --batch_size 16 \
   --max_len 512 \
   --num_workers 8 \
-  --fa2 \
-  --output medical.graft.pt
+  --fa2
 
 ```
 
 Evaluate standalone artifact boundaries:
 
 ```bash
-uv run python eval.py eval --graft medical.graft.pt --data medical.jsonl
+python eval.py eval --graft medical.graft --data data/medical.jsonl
 
 ```
 
 Stack artifacts and measure interference prior to installation:
 
 ```bash
-uv run python eval.py stack-test \
-  --grafts medical.graft.pt legal.graft.pt coding.graft.pt finance.graft.pt \
-  --data medical.jsonl legal.jsonl coding.jsonl finance.jsonl
+python eval.py stack-test \
+  --grafts medical.graft legal.graft coding.graft finance.graft \
+  --data data/medical.jsonl data/legal.jsonl data/coding.jsonl data/finance.jsonl
 
 ```
 
 Bake artifacts directly into the model weights (creates a new directory):
 
 ```bash
-uv run python eval.py install \
-  --graft medical.graft.pt legal.graft.pt coding.graft.pt finance.graft.pt \
+python eval.py install \
+  --graft medical.graft legal.graft coding.graft finance.graft \
   --output smol-grafted
 
 ```

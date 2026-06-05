@@ -13,20 +13,12 @@ from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from dataset import EvalDataset, load_jsonl
-from engine import discover_ffn_layers, get_device, get_model_dtype, resolve_model_path
+from safetensors import safe_open
+from engine import compute_axis_slices, discover_ffn_layers, get_device, get_model_dtype, resolve_model_path
 
 
 DEFAULT_MODEL = "HuggingFaceTB/SmolLM3-3B"
 GRAFT_VERSION = "0.3-axis-arw"
-REQUIRED_GRAFT_KEYS = {
-    "category",
-    "delta_slice",
-    "inter_start",
-    "inter_end",
-    "res_start",
-    "res_end",
-}
-
 
 def compute_ppl(model, dataset, device):
     loader = DataLoader(dataset, batch_size=1, shuffle=False)
@@ -57,17 +49,21 @@ def compute_ppl(model, dataset, device):
 
 def load_graft(path):
     try:
-        art = torch.load(path, map_location="cpu", weights_only=True)
-    except TypeError:
-        art = torch.load(path, map_location="cpu")
-
-    if not isinstance(art, dict) or art.get("version") != GRAFT_VERSION:
-        sys.exit(f"{path} is not a valid {GRAFT_VERSION} graft.")
-    if not isinstance(art.get("grafts"), dict) or not art["grafts"]:
-        sys.exit(f"{path} has no graft tensors.")
-
-    art["_path"] = path
-    return art
+        with safe_open(path, framework="pt", device="cpu") as f:
+            meta = f.metadata()
+            if meta.get("version") != GRAFT_VERSION:
+                sys.exit(f"{path} is not a valid {GRAFT_VERSION} graft.")
+            return {
+                "_path": path,
+                "model": meta["model"],
+                "domain_index": int(meta["domain_index"]),
+                "max_domains": int(meta["max_domains"]),
+                "layer_range": meta.get("layer_range") or None,
+                "steps": int(meta.get("steps", 0)),
+                "tensors": {key: f.get_tensor(key) for key in f.keys()}
+            }
+    except Exception as e:
+        sys.exit(f"Failed to load {path}: {e}")
 
 
 def resolve_base_model(artifacts, model_arg):
@@ -94,92 +90,50 @@ def clear_cuda_cache():
         torch.cuda.empty_cache()
 
 
-def _summarize(items, limit=3):
-    shown = ", ".join(items[:limit])
-    return shown if len(items) <= limit else f"{shown}, ... (+{len(items) - limit} more)"
-
-
-def validate_graft_against_layers(art, path, layers):
-    missing_layers, invalid = [], []
-
-    for name, graft in art["grafts"].items():
+def validate_graft_against_layers(art, path, layers, slices):
+    for name, delta_slice in art["tensors"].items():
         if name not in layers:
-            missing_layers.append(name)
-            continue
-
-        missing_keys = sorted(REQUIRED_GRAFT_KEYS - set(graft))
-        if missing_keys:
-            invalid.append(f"{name}: missing keys {missing_keys}")
-            continue
-
-        mod = layers[name]["module"]
-        out_features, in_features = mod.weight.shape
-        category = graft["category"]
-        inter_s, inter_e = graft["inter_start"], graft["inter_end"]
-        res_s, res_e = graft["res_start"], graft["res_end"]
-
-        if category != layers[name]["category"]:
-            invalid.append(f"{name}: category mismatch")
-            continue
-        if category not in {"ffn_expand", "ffn_contract"}:
-            invalid.append(f"{name}: invalid category")
-            continue
-        if inter_e <= inter_s or res_e <= res_s:
-            invalid.append(f"{name}: invalid slice")
-            continue
-        if not torch.is_tensor(graft["delta_slice"]):
-            invalid.append(f"{name}: delta_slice is not a tensor")
-            continue
-
-        inter_axis = out_features if category == "ffn_expand" else in_features
-        res_axis = in_features if category == "ffn_expand" else out_features
-        if inter_e > inter_axis or res_e > res_axis:
-            invalid.append(f"{name}: slice exceeds axis")
-            continue
-
+            sys.exit(f"{path} references missing layer: {name}")
+        if name not in slices:
+            sys.exit(f"{path} references layer {name} which is not in the computed slices.")
+        s = slices[name]
         expected_shape = (
-            (inter_e - inter_s, res_e - res_s)
-            if category == "ffn_expand"
-            else (res_e - res_s, inter_e - inter_s)
+            (s["inter_end"] - s["inter_start"], s["res_end"] - s["res_start"])
+            if s["category"] == "ffn_expand"
+            else (s["res_end"] - s["res_start"], s["inter_end"] - s["inter_start"])
         )
-        if tuple(graft["delta_slice"].shape) != expected_shape:
-            invalid.append(f"{name}: shape mismatch")
-            continue
-
-        if "weight_shape" in graft and list(mod.weight.shape) != list(graft["weight_shape"]):
-            invalid.append(f"{name}: source weight shape mismatch")
-
-    if missing_layers:
-        sys.exit(f"{path} references missing layers: {_summarize(missing_layers)}")
-    if invalid:
-        sys.exit(f"{path} is incompatible: {_summarize(invalid)}")
+        if tuple(delta_slice.shape) != expected_shape:
+            sys.exit(f"{path} shape mismatch for {name}: expected {expected_shape}, got {tuple(delta_slice.shape)}")
 
 
-def validate_non_overlapping_grafts(artifacts, paths):
+def validate_non_overlapping_grafts(artifacts, paths, layers, hidden_size):
     max_domains = {art.get("max_domains") for art in artifacts}
     if len(max_domains) != 1 or None in max_domains:
-        sys.exit("Stacked grafts must all declare the same max_domains value.")
+        sys.exit("Error: Stacked grafts must all declare the same max_domains value.")
 
     seen_domains, occupied = {}, {}
     for art, path in zip(artifacts, paths):
         domain_index = art.get("domain_index")
         if not isinstance(domain_index, int):
-            sys.exit(f"{path} does not declare an integer domain_index.")
+            sys.exit(f"Error: {path} does not declare an integer domain_index.")
         if domain_index in seen_domains:
-            sys.exit(f"Duplicate domain_index {domain_index}: {seen_domains[domain_index]} and {path}")
+            sys.exit(f"Collision: Duplicate domain_index {domain_index} between {seen_domains[domain_index]} and {path}")
         seen_domains[domain_index] = path
 
-        for name, graft in art["grafts"].items():
-            key = (name, graft["category"])
-            i_s, i_e = graft["inter_start"], graft["inter_end"]
-            r_s, r_e = graft["res_start"], graft["res_end"]
+        slices = compute_axis_slices(layers, domain_index, list(max_domains)[0], hidden_size)
+        for name in art["tensors"].keys():
+            if name not in slices:
+                continue
+            s = slices[name]
+            key = (name, s["category"])
+            i_s, i_e = s["inter_start"], s["inter_end"]
+            r_s, r_e = s["res_start"], s["res_end"]
 
             for pi_s, pi_e, pr_s, pr_e, prev_path in occupied.get(key, []):
                 inter_overlaps = max(i_s, pi_s) < min(i_e, pi_e)
                 residual_overlaps = max(r_s, pr_s) < min(r_e, pr_e)
                 if inter_overlaps and residual_overlaps:
-                    sys.exit(f"Overlapping slices for {name}: {prev_path} and {path}")
-
+                    sys.exit(f"Spatial Breach: Overlapping slices for layer {name} between {prev_path} and {path}")
             occupied.setdefault(key, []).append((i_s, i_e, r_s, r_e, path))
 
 
@@ -199,20 +153,22 @@ def delta_output_energy(x, delta_info):
 
 def apply_graft_to_model(model, art, device):
     layers = discover_ffn_layers(model, art.get("layer_range"))
-    validate_graft_against_layers(art, art.get("_path", "<artifact>"), layers)
+    hidden_size = getattr(model.config, "hidden_size", None)
+    if hidden_size is None:
+        sys.exit("Model config does not expose hidden_size.")
+    slices = compute_axis_slices(layers, art["domain_index"], art["max_domains"], hidden_size)
+    validate_graft_against_layers(art, art.get("_path", "<artifact>"), layers, slices)
 
     with torch.no_grad():
-        for name, graft in art["grafts"].items():
+        for name, delta_slice in art["tensors"].items():
             mod = layers[name]["module"]
-            category = graft["category"]
-            i_s, i_e = graft["inter_start"], graft["inter_end"]
-            r_s, r_e = graft["res_start"], graft["res_end"]
-            delta_slice = graft["delta_slice"].to(device=device, dtype=mod.weight.dtype)
+            s = slices[name]
+            delta_slice = delta_slice.to(device=device, dtype=mod.weight.dtype)
 
-            if category == "ffn_expand":
-                mod.weight.data[i_s:i_e, r_s:r_e] += delta_slice
+            if s["category"] == "ffn_expand":
+                mod.weight.data[s["inter_start"]:s["inter_end"], s["res_start"]:s["res_end"]] += delta_slice
             else:
-                mod.weight.data[r_s:r_e, i_s:i_e] += delta_slice
+                mod.weight.data[s["res_start"]:s["res_end"], s["inter_start"]:s["inter_end"]] += delta_slice
 
 
 def print_eval_result(graft_path, vanilla_ppl, grafted_ppl):
@@ -249,7 +205,7 @@ def cmd_eval(args):
 
 def cmd_compare(args):
     if len(args.grafts) % 2 != 0:
-        sys.exit("compare expects pairs: graft.pt data.jsonl [graft.pt data.jsonl ...]")
+        sys.exit("compare expects pairs: graft data.jsonl [graft data.jsonl ...]")
 
     pairs = list(zip(args.grafts[0::2], args.grafts[1::2]))
     artifacts = [load_graft(graft_path) for graft_path, _ in pairs]
@@ -270,7 +226,6 @@ def cmd_stack_test(args):
 
     device = get_device(args.device)
     artifacts = [load_graft(g) for g in args.grafts]
-    validate_non_overlapping_grafts(artifacts, args.grafts)
 
     model_path = resolve_model_path(resolve_base_model(artifacts, args.model))
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
@@ -289,32 +244,36 @@ def cmd_stack_test(args):
     print("\nStacked PPL and bleed diagnostics")
     stacked_model = load_model(model_path, device, args.fa2)
     all_layers = discover_ffn_layers(stacked_model)
+    hidden_size = getattr(stacked_model.config, "hidden_size", None)
+    if hidden_size is None:
+        sys.exit("Model config does not expose hidden_size.")
+    validate_non_overlapping_grafts(artifacts, args.grafts, all_layers, hidden_size)
+
     artifact_deltas = []
 
     for art in artifacts:
         art_layers = discover_ffn_layers(stacked_model, art.get("layer_range"))
-        validate_graft_against_layers(art, art.get("_path", "<artifact>"), art_layers)
+        slices = compute_axis_slices(art_layers, art["domain_index"], art["max_domains"], hidden_size)
+        validate_graft_against_layers(art, art.get("_path", "<artifact>"), art_layers, slices)
         deltas = {}
 
         with torch.no_grad():
-            for name, graft in art["grafts"].items():
+            for name, delta_slice in art["tensors"].items():
                 mod = art_layers[name]["module"]
-                category = graft["category"]
-                i_s, i_e = graft["inter_start"], graft["inter_end"]
-                r_s, r_e = graft["res_start"], graft["res_end"]
-                delta_slice = graft["delta_slice"].to(device=device, dtype=mod.weight.dtype)
+                s = slices[name]
+                delta_slice = delta_slice.to(device=device, dtype=mod.weight.dtype)
 
-                if category == "ffn_expand":
-                    mod.weight.data[i_s:i_e, r_s:r_e] += delta_slice
+                if s["category"] == "ffn_expand":
+                    mod.weight.data[s["inter_start"]:s["inter_end"], s["res_start"]:s["res_end"]] += delta_slice
                 else:
-                    mod.weight.data[r_s:r_e, i_s:i_e] += delta_slice
+                    mod.weight.data[s["res_start"]:s["res_end"], s["inter_start"]:s["inter_end"]] += delta_slice
 
                 deltas[name] = {
-                    "category": category,
-                    "inter_start": i_s,
-                    "inter_end": i_e,
-                    "res_start": r_s,
-                    "res_end": r_e,
+                    "category": s["category"],
+                    "inter_start": s["inter_start"],
+                    "inter_end": s["inter_end"],
+                    "res_start": s["res_start"],
+                    "res_end": s["res_end"],
                     "delta_slice": delta_slice.detach(),
                 }
 
@@ -374,12 +333,17 @@ def cmd_stack_test(args):
 def cmd_install(args):
     device = get_device(args.device)
     artifacts = [load_graft(g) for g in args.graft]
-    validate_non_overlapping_grafts(artifacts, args.graft)
 
     model_path = resolve_model_path(resolve_base_model(artifacts, args.model))
     print(f"[install] Baking {len(artifacts)} grafts into {model_path}")
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     model = load_model(model_path, device, args.fa2)
+
+    all_layers = discover_ffn_layers(model)
+    hidden_size = getattr(model.config, "hidden_size", None)
+    if hidden_size is None:
+        sys.exit("Model config does not expose hidden_size.")
+    validate_non_overlapping_grafts(artifacts, args.graft, all_layers, hidden_size)
 
     for art, graft_path in zip(artifacts, args.graft):
         apply_graft_to_model(model, art, device)
@@ -407,7 +371,7 @@ def main():
     add_common_model_args(eval_parser)
 
     compare_parser = subparsers.add_parser("compare", help="Evaluate graft/data pairs.")
-    compare_parser.add_argument("--grafts", nargs="+", required=True, help="Pairs: graft.pt data.jsonl [graft.pt data.jsonl ...]")
+    compare_parser.add_argument("--grafts", nargs="+", required=True, help="Pairs: graft data.jsonl [graft data.jsonl ...]")
     add_common_model_args(compare_parser)
 
     stack_parser = subparsers.add_parser("stack-test", help="Evaluate stacked graft interference.")

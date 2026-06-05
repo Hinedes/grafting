@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 import argparse
+import glob
+import os
 import sys
 
 import torch
 import torch.nn.functional as F
+from safetensors import safe_open
+from safetensors.torch import save_file
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -18,6 +22,38 @@ from engine import (
     resolve_model_path,
 )
 
+def resolve_domain_path(name_or_path):
+    if os.path.sep not in name_or_path and not name_or_path.endswith(".jsonl"):
+        resolved = os.path.join("data", f"{name_or_path}.jsonl")
+        if not os.path.exists(resolved):
+            sys.exit(f"No data file for domain '{name_or_path}' (expected {resolved}). Run python dataset.py --domains {name_or_path} first.")
+        return resolved
+    return name_or_path
+
+def auto_ood_paths(domain_path):
+    data_dir = "data"
+    if not os.path.isdir(data_dir):
+        return []
+    domain_abs = os.path.abspath(domain_path)
+    all_jsonl = sorted(glob.glob(os.path.join(data_dir, "*.jsonl")))
+    return [p for p in all_jsonl if os.path.abspath(p) != domain_abs]
+
+def auto_domain_index():
+    grafts = sorted(glob.glob("*.graft"))
+    if not grafts:
+        return 0
+    max_idx = -1
+    for g in grafts:
+        try:
+            with safe_open(g, framework="pt", device="cpu") as f:
+                meta = f.metadata()
+                if meta and "domain_index" in meta:
+                    max_idx = max(max_idx, int(meta["domain_index"]))
+        except Exception:
+            continue
+    return max_idx + 1
+
+
 def endless_batches(loader):
     while True:
         for batch in loader:
@@ -26,9 +62,12 @@ def endless_batches(loader):
 def main():
     parser = argparse.ArgumentParser(description="Axis ARW 0.3 - Train Graft")
     parser.add_argument("--model", required=True)
-    parser.add_argument("--domain_data", required=True)
-    parser.add_argument("--ood_data", nargs="+", required=True)
-    parser.add_argument("--domain_index", type=int, required=True)
+    parser.add_argument("--domain_data", required=True,
+                        help="Domain name (e.g. medical) or path to a JSONL file.")
+    parser.add_argument("--ood_data", nargs="*", default=None,
+                        help="OOD JSONL files. Defaults to all other .jsonl files in data/.")
+    parser.add_argument("--domain_index", type=int, default=None,
+                        help="Axis slice index. Defaults to next available after existing grafts.")
     parser.add_argument("--max_domains", type=int, default=4)
     parser.add_argument("--layer_range", default=None)
     parser.add_argument("--lambda_silence", type=float, default=5.0)
@@ -40,9 +79,28 @@ def main():
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--fa2", action="store_true", help="Use FlashAttention 2 when supported by the model and device.")
-    parser.add_argument("--output", default="graft.pt")
+    parser.add_argument("--output", default=None, help="Output graft path. Defaults to <domain>.graft.")
     parser.add_argument("--device", default="auto")
     args = parser.parse_args()
+
+    domain_arg = args.domain_data
+    args.domain_data = resolve_domain_path(args.domain_data)
+
+    if args.output is None:
+        stem = os.path.splitext(os.path.basename(domain_arg))[0]
+        args.output = f"{stem}.graft"
+
+    if args.ood_data is not None and len(args.ood_data) == 0:
+        sys.exit("--ood_data requires at least one file if provided.")
+    if args.ood_data is None:
+        args.ood_data = auto_ood_paths(args.domain_data)
+        if not args.ood_data:
+            sys.exit("No OOD data files found in data/. Run python dataset.py or provide --ood_data explicitly.")
+
+    if args.domain_index is None:
+        args.domain_index = auto_domain_index()
+        print(f"[train] Auto domain_index: {args.domain_index}")
+        print(f"[train] Auto OOD: {args.ood_data}")
 
     device = get_device(args.device)
     amp_dtype = get_amp_dtype(device)
@@ -59,7 +117,7 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model_kwargs = {"trust_remote_code": True, "torch_dtype": model_dtype}
+    model_kwargs = {"trust_remote_code": True, "dtype": model_dtype}
     if args.fa2 and device.type == "cuda":
         model_kwargs["attn_implementation"] = "flash_attention_2"
     model = AutoModelForCausalLM.from_pretrained(model_path, **model_kwargs).to(device)
@@ -97,23 +155,25 @@ def main():
     def save_artifact(step_count, out_path):
         delta_injector.detach()
         try:
-            graft = {}
+            tensors = {}
             with torch.no_grad():
                 for name, info in layers.items():
                     if name not in slices:
                         continue
                     safe_name = name.replace(".", "_")
-                    s = slices[name]
-                    graft[name] = {
-                        "delta_slice": delta_injector.deltas[safe_name].detach().to(torch.bfloat16).cpu(),
-                        "category": s["category"],
-                        "inter_start": s["inter_start"], "inter_end": s["inter_end"],
-                        "res_start": s["res_start"], "res_end": s["res_end"],
-                        "weight_shape": list(info["module"].weight.shape),
-                    }
-            delta_bytes = sum(g["delta_slice"].numel() * g["delta_slice"].element_size() for g in graft.values())
-            torch.save({"version": "0.3-axis-arw", "model": args.model, "layer_range": args.layer_range, "domain_index": args.domain_index, "max_domains": args.max_domains, "steps": step_count, "grafts": graft}, out_path)
-            print(f"[train] Saved {out_path} ({delta_bytes / (1024**2):.2f} MB)")
+                    tensors[name] = delta_injector.deltas[safe_name].detach().to(torch.bfloat16).cpu()
+            meta = {
+                "version": "0.3-axis-arw",
+                "model": args.model,
+                "domain_index": str(args.domain_index),
+                "max_domains": str(args.max_domains),
+                "layer_range": args.layer_range or "",
+                "steps": str(step_count)
+            }
+            graft_path = out_path
+            save_file(tensors, graft_path, metadata=meta)
+            delta_bytes = sum(t.numel() * t.element_size() for t in tensors.values())
+            print(f"[train] Saved {graft_path} ({delta_bytes / (1024**2):.2f} MB)")
         finally:
             delta_injector.attach()
 

@@ -2,7 +2,7 @@ __pycache__/
 *.py[cod]
 
 *.jsonl
-*.graft.pt
+*.graft
 *.pt
 *.safetensors
 
@@ -12,3 +12,4 @@ venv/
 
 SmolLM*/
 *-axis-arw/
+changes.txt
